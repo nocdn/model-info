@@ -30,7 +30,7 @@
       "title": "Model Info",
       "description": "Command will search for the model, and show it's info.",
       "mode": "view",
-      "subtitle": "Find into on any language model"
+      "subtitle": "Find info on any language model"
     }
   ],
   "preferences": [
