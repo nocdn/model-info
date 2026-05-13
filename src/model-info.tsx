@@ -9,11 +9,13 @@ import {
 import React from "react";
 
 const OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1";
+const ARTIFICIAL_ANALYSIS_API_BASE_URL = "https://artificialanalysis.ai/api/v2";
 const LOG_PREFIX = "[Model Info]";
 const MAX_LOGGED_RESPONSE_BODY_LENGTH = 2_000;
 
 type Preferences = {
   openRouterApiKey?: string;
+  artificialAnalysisApiKey?: string;
 };
 
 type PercentileStats = {
@@ -51,21 +53,59 @@ type OpenRouterModelsResponse = {
   data: OpenRouterModel[];
 };
 
+type ArtificialAnalysisModel = {
+  id: string;
+  name: string;
+  slug: string;
+  model_creator?: {
+    id: string;
+    name: string;
+    slug?: string;
+  };
+  evaluations?: {
+    artificial_analysis_intelligence_index?: number | null;
+  };
+};
+
+type ArtificialAnalysisModelsResponse = {
+  status: number;
+  data: ArtificialAnalysisModel[];
+};
+
+type IntelligenceIndexEntry = {
+  label: string;
+  score: number;
+};
+
+type IntelligenceIndexResult = {
+  entries: IntelligenceIndexEntry[];
+  note: string;
+};
+
 type LookupResult = {
   modelId: string;
-  modelName: string;
-  endpoints: OpenRouterEndpoint[];
+  modelName?: string;
+  endpoints?: OpenRouterEndpoint[];
+  throughputError?: string;
+  intelligenceIndex?: IntelligenceIndexResult;
 };
 
 type LookupState =
   | { status: "idle" }
-  | { status: "loading"; query: string }
+  | {
+      status: "loading";
+      query: string;
+      result?: LookupResult;
+      hasApiKey: boolean;
+      requestId: number;
+    }
   | { status: "success"; result: LookupResult; hasApiKey: boolean }
   | { status: "error"; message: string };
 
 export default function ModelInfo() {
   const [model, setModel] = React.useState("");
   const [lookup, setLookup] = React.useState<LookupState>({ status: "idle" });
+  const lookupRequestId = React.useRef(0);
 
   const lookUpModel = async () => {
     const query = model.trim();
@@ -73,10 +113,13 @@ export default function ModelInfo() {
 
     const preferences = getPreferenceValues<Preferences>();
     const apiKey = preferences.openRouterApiKey?.trim();
+    const artificialAnalysisApiKey =
+      preferences.artificialAnalysisApiKey?.trim();
 
     console.info(`${LOG_PREFIX} Starting model lookup`, {
       query,
       hasOpenRouterApiKey: Boolean(apiKey),
+      hasArtificialAnalysisApiKey: Boolean(artificialAnalysisApiKey),
     });
 
     if (!apiKey) {
@@ -92,20 +135,125 @@ export default function ModelInfo() {
       return;
     }
 
-    setLookup({ status: "loading", query });
+    const requestId = lookupRequestId.current + 1;
+    lookupRequestId.current = requestId;
+    setLookup({
+      status: "loading",
+      query,
+      hasApiKey: Boolean(apiKey),
+      requestId,
+    });
+
+    const toast = await showToast({
+      style: Toast.Style.Animated,
+      title: "Fetching Model Data",
+    });
 
     try {
-      const result = await fetchModelThroughput(query, apiKey);
-      console.info(`${LOG_PREFIX} Model lookup succeeded`, {
+      const modelId = await resolveModelId(query, apiKey);
+      if (lookupRequestId.current !== requestId) return;
+
+      setLookup({
+        status: "loading",
         query,
-        modelId: result.modelId,
-        modelName: result.modelName,
-        endpointCount: result.endpoints.length,
-        endpointsWithThroughputCount: result.endpoints.filter(
-          (endpoint) => endpoint.throughput_last_30m,
-        ).length,
+        result: { modelId },
+        hasApiKey: Boolean(apiKey),
+        requestId,
       });
-      setLookup({ status: "success", result, hasApiKey: Boolean(apiKey) });
+
+      const updateLoadingResult = (
+        update: (result: LookupResult) => LookupResult,
+      ) => {
+        setLookup((currentLookup) => {
+          if (
+            currentLookup.status !== "loading" ||
+            currentLookup.requestId !== requestId ||
+            !currentLookup.result
+          ) {
+            return currentLookup;
+          }
+
+          return {
+            ...currentLookup,
+            result: update(currentLookup.result),
+          };
+        });
+      };
+
+      const throughputLookup = fetchModelThroughput(modelId, apiKey)
+        .then((throughput) => {
+          updateLoadingResult((currentResult) => ({
+            ...currentResult,
+            modelName: throughput.modelName,
+            endpoints: throughput.endpoints,
+          }));
+
+          console.info(`${LOG_PREFIX} Model throughput lookup succeeded`, {
+            query,
+            modelId: throughput.modelId,
+            modelName: throughput.modelName,
+            endpointCount: throughput.endpoints.length,
+            endpointsWithThroughputCount: throughput.endpoints.filter(
+              (endpoint) => endpoint.throughput_last_30m,
+            ).length,
+          });
+        })
+        .catch((error) => {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Failed to look up model throughput.";
+          console.error(`${LOG_PREFIX} Model throughput lookup failed`, {
+            query,
+            modelId,
+            message,
+            error,
+          });
+          updateLoadingResult((currentResult) => ({
+            ...currentResult,
+            throughputError: message,
+          }));
+        });
+
+      const intelligenceIndexLookup = fetchIntelligenceIndex(
+        query,
+        modelId,
+        undefined,
+        artificialAnalysisApiKey,
+      ).then((intelligenceIndex) => {
+        updateLoadingResult((currentResult) => ({
+          ...currentResult,
+          intelligenceIndex,
+        }));
+
+        console.info(`${LOG_PREFIX} Intelligence Index lookup completed`, {
+          query,
+          modelId,
+          intelligenceIndexEntryCount: intelligenceIndex.entries.length,
+        });
+      });
+
+      await Promise.all([throughputLookup, intelligenceIndexLookup]);
+      if (lookupRequestId.current !== requestId) return;
+
+      setLookup((currentLookup) => {
+        if (
+          currentLookup.status !== "loading" ||
+          currentLookup.requestId !== requestId ||
+          !currentLookup.result
+        ) {
+          return currentLookup;
+        }
+
+        return {
+          status: "success",
+          result: currentLookup.result,
+          hasApiKey: currentLookup.hasApiKey,
+        };
+      });
+
+      toast.style = Toast.Style.Success;
+      toast.title = "Data Fetched";
     } catch (error) {
       const message =
         error instanceof Error
@@ -117,11 +265,9 @@ export default function ModelInfo() {
         error,
       });
       setLookup({ status: "error", message });
-      await showToast({
-        style: Toast.Style.Failure,
-        title: "Lookup Failed",
-        message,
-      });
+      toast.style = Toast.Style.Failure;
+      toast.title = "Lookup Failed";
+      toast.message = message;
     }
   };
 
@@ -136,7 +282,7 @@ export default function ModelInfo() {
       onSearchTextChange={setModel}
       throttle={false}
       navigationTitle="Model Info"
-      searchBarPlaceholder="Enter an OpenRouter model, e.g. openai/gpt-4o"
+      searchBarPlaceholder="Enter an OpenRouter model, e.g. gpt-5.5"
       actions={
         <ActionPanel>
           <Action title="Look up Model" onAction={() => void lookUpModel()} />
@@ -153,8 +299,11 @@ export default function ModelInfo() {
             <Action title="Look up Model" onAction={() => void lookUpModel()} />
             {lookup.status === "success" ? (
               <Action.CopyToClipboard
-                title="Copy Throughput"
-                content={getThroughputMarkdown(lookup.result, lookup.hasApiKey)}
+                title="Copy Model Details"
+                content={getModelDetailsMarkdown(
+                  lookup.result,
+                  lookup.hasApiKey,
+                )}
               />
             ) : null}
           </ActionPanel>
@@ -165,14 +314,16 @@ export default function ModelInfo() {
 }
 
 async function fetchModelThroughput(
-  query: string,
+  modelId: string,
   apiKey: string | undefined,
-): Promise<LookupResult> {
-  const modelId = await resolveModelId(query, apiKey);
+): Promise<{
+  modelId: string;
+  modelName: string;
+  endpoints: OpenRouterEndpoint[];
+}> {
   const endpointsPath = getModelEndpointsPath(modelId);
 
   console.info(`${LOG_PREFIX} Fetching model endpoints`, {
-    query,
     modelId,
     path: endpointsPath,
   });
@@ -187,6 +338,47 @@ async function fetchModelThroughput(
     modelName: response.data.name,
     endpoints: response.data.endpoints,
   };
+}
+
+async function fetchIntelligenceIndex(
+  query: string,
+  modelId: string,
+  modelName: string | undefined,
+  apiKey: string | undefined,
+): Promise<IntelligenceIndexResult> {
+  if (!apiKey) {
+    return {
+      entries: [],
+      note: "Configure an Artificial Analysis API key in preferences to show Intelligence Index scores.",
+    };
+  }
+
+  try {
+    const response =
+      await artificialAnalysisFetch<ArtificialAnalysisModelsResponse>(
+        "/data/llms/models",
+        apiKey,
+      );
+
+    return getIntelligenceIndexResult(response.data, query, modelId, modelName);
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Artificial Analysis Intelligence Index lookup failed.";
+    console.error(`${LOG_PREFIX} Artificial Analysis lookup failed`, {
+      query,
+      modelId,
+      modelName,
+      message,
+      error,
+    });
+
+    return {
+      entries: [],
+      note: message,
+    };
+  }
 }
 
 async function resolveModelId(
@@ -307,6 +499,75 @@ async function openRouterFetch<T>(
   }
 }
 
+async function artificialAnalysisFetch<T>(
+  path: string,
+  apiKey: string,
+): Promise<T> {
+  const url = `${ARTIFICIAL_ANALYSIS_API_BASE_URL}${path}`;
+  const startedAt = Date.now();
+
+  console.info(`${LOG_PREFIX} Artificial Analysis request`, {
+    method: "GET",
+    url,
+    hasApiKeyHeader: Boolean(apiKey),
+  });
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+      },
+    });
+  } catch (error) {
+    console.error(
+      `${LOG_PREFIX} Artificial Analysis request failed before response`,
+      {
+        method: "GET",
+        url,
+        durationMs: Date.now() - startedAt,
+        error,
+      },
+    );
+    throw error;
+  }
+
+  const bodyText = await response.text();
+  const durationMs = Date.now() - startedAt;
+
+  console.info(`${LOG_PREFIX} Artificial Analysis response`, {
+    method: "GET",
+    url,
+    status: response.status,
+    statusText: response.statusText,
+    ok: response.ok,
+    durationMs,
+    bodyLength: bodyText.length,
+    bodyPreview: truncateForLog(bodyText),
+  });
+
+  if (!response.ok) {
+    throw new Error(getArtificialAnalysisErrorMessage(response, bodyText));
+  }
+
+  try {
+    return JSON.parse(bodyText) as T;
+  } catch (error) {
+    console.error(
+      `${LOG_PREFIX} Failed to parse Artificial Analysis JSON response`,
+      {
+        method: "GET",
+        url,
+        status: response.status,
+        bodyPreview: truncateForLog(bodyText),
+        error,
+      },
+    );
+    throw new Error("Artificial Analysis returned an invalid JSON response.");
+  }
+}
+
 function getOpenRouterErrorMessage(
   response: Response,
   bodyText: string,
@@ -316,6 +577,22 @@ function getOpenRouterErrorMessage(
     return body.error?.message ?? `OpenRouter returned ${response.status}.`;
   } catch {
     return `OpenRouter returned ${response.status}.`;
+  }
+}
+
+function getArtificialAnalysisErrorMessage(
+  response: Response,
+  bodyText: string,
+): string {
+  try {
+    const body = JSON.parse(bodyText) as { error?: string; message?: string };
+    return (
+      body.error ??
+      body.message ??
+      `Artificial Analysis returned ${response.status}.`
+    );
+  } catch {
+    return `Artificial Analysis returned ${response.status}.`;
   }
 }
 
@@ -379,27 +656,249 @@ function normalizeForSearch(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function getIntelligenceIndexResult(
+  models: ArtificialAnalysisModel[],
+  query: string,
+  modelId: string,
+  modelName: string | undefined,
+): IntelligenceIndexResult {
+  const candidates = getArtificialAnalysisSearchKeys(query, modelId, modelName);
+  const scoredMatches = models
+    .map((model) => ({
+      model,
+      score: getArtificialAnalysisMatchScore(model, candidates),
+    }))
+    .filter(
+      (match) =>
+        match.score > 0 &&
+        match.model.evaluations?.artificial_analysis_intelligence_index != null,
+    )
+    .sort(
+      (a, b) => b.score - a.score || a.model.name.localeCompare(b.model.name),
+    );
+
+  const bestMatch = scoredMatches[0];
+  if (!bestMatch) {
+    return {
+      entries: [],
+      note: "No Artificial Analysis Intelligence Index score was found for this model.",
+    };
+  }
+
+  const bestBaseKeys = getArtificialAnalysisModelKeys(bestMatch.model).base;
+  const groupedMatches = models
+    .filter(
+      (model) =>
+        model.evaluations?.artificial_analysis_intelligence_index != null &&
+        intersects(getArtificialAnalysisModelKeys(model).base, bestBaseKeys),
+    )
+    .sort(compareArtificialAnalysisModels);
+
+  const entries = groupedMatches.map((model) => ({
+    label: getIntelligenceIndexLabel(model, groupedMatches.length),
+    score: model.evaluations?.artificial_analysis_intelligence_index ?? 0,
+  }));
+
+  return { entries, note: "" };
+}
+
+function getArtificialAnalysisSearchKeys(
+  query: string,
+  modelId: string,
+  modelName: string | undefined,
+): { full: string[]; base: string[] } {
+  const parsedQuery = parseModelId(query);
+  const modelIdParts = modelId.split("/");
+  const modelProvider = modelIdParts.at(0) ?? "";
+  const modelSlug = modelIdParts.at(-1) ?? modelId;
+  const rawValues = [
+    query,
+    parsedQuery,
+    modelId,
+    `${modelProvider} ${modelSlug}`,
+    modelSlug,
+    modelName ?? "",
+    stripModelProviderPrefix(modelName ?? ""),
+  ];
+
+  return {
+    full: normalizeArtificialAnalysisKeys(rawValues),
+    base: normalizeArtificialAnalysisKeys(rawValues.map(stripReasoningTier)),
+  };
+}
+
+function getArtificialAnalysisModelKeys(model: ArtificialAnalysisModel): {
+  full: string[];
+  base: string[];
+} {
+  const slugWithoutCreator = stripCreatorSlugPrefix(
+    model.slug,
+    model.model_creator?.slug,
+  );
+  const rawValues = [model.name, model.slug, slugWithoutCreator];
+
+  return {
+    full: normalizeArtificialAnalysisKeys(rawValues),
+    base: normalizeArtificialAnalysisKeys(rawValues.map(stripReasoningTier)),
+  };
+}
+
+function getArtificialAnalysisMatchScore(
+  model: ArtificialAnalysisModel,
+  candidates: { full: string[]; base: string[] },
+): number {
+  const modelKeys = getArtificialAnalysisModelKeys(model);
+
+  if (intersects(modelKeys.full, candidates.full)) return 100;
+  if (intersects(modelKeys.base, candidates.base)) return 90;
+  if (intersects(modelKeys.full, candidates.base)) return 80;
+  if (intersects(modelKeys.base, candidates.full)) return 80;
+
+  return 0;
+}
+
+function compareArtificialAnalysisModels(
+  a: ArtificialAnalysisModel,
+  b: ArtificialAnalysisModel,
+): number {
+  return (
+    getReasoningTierSortRank(getReasoningTier(a.name)) -
+      getReasoningTierSortRank(getReasoningTier(b.name)) ||
+    a.name.localeCompare(b.name)
+  );
+}
+
+function getIntelligenceIndexLabel(
+  model: ArtificialAnalysisModel,
+  groupSize: number,
+): string {
+  const reasoningTier = getReasoningTier(model.name);
+  if (groupSize > 1 && reasoningTier) return reasoningTier;
+
+  return model.name;
+}
+
+function getReasoningTier(value: string): string | undefined {
+  return value.match(/\(([^()]+)\)\s*$/)?.[1];
+}
+
+function getReasoningTierSortRank(value: string | undefined): number {
+  const normalizedValue = normalizeForSearch(value ?? "");
+  if (normalizedValue.includes("max")) return 0;
+  if (normalizedValue === "xhigh" || normalizedValue.includes("extra high"))
+    return 1;
+  if (normalizedValue.includes("high")) return 2;
+  if (normalizedValue.includes("medium")) return 3;
+  if (normalizedValue.includes("low")) return 4;
+  if (normalizedValue.includes("minimal")) return 5;
+
+  return 6;
+}
+
+function normalizeArtificialAnalysisKeys(values: string[]): string[] {
+  return Array.from(
+    new Set(
+      values
+        .map(normalizeArtificialAnalysisKey)
+        .filter((value) => value.length > 0),
+    ),
+  );
+}
+
+function normalizeArtificialAnalysisKey(value: string): string {
+  return stripModelProviderPrefix(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function stripReasoningTier(value: string): string {
+  return value.replace(/\s*\([^)]*\)\s*$/g, "").replace(/--[^-]+$/g, "");
+}
+
+function stripModelProviderPrefix(value: string): string {
+  return value.replace(/^[^:]+:\s*/, "");
+}
+
+function stripCreatorSlugPrefix(
+  slug: string,
+  creatorSlug: string | undefined,
+): string {
+  if (!creatorSlug) return slug;
+
+  return slug.replace(new RegExp(`^${escapeRegExp(creatorSlug)}[-_]`, "i"), "");
+}
+
+function intersects(left: string[], right: string[]): boolean {
+  const rightSet = new Set(right);
+  return left.some((value) => rightSet.has(value));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function getDetailMarkdown(lookup: LookupState): string {
   if (lookup.status === "idle") {
     return "Type an OpenRouter model ID or name, then press Enter to look up provider throughput.";
   }
 
   if (lookup.status === "loading") {
-    return `Looking up throughput for **${escapeMarkdown(lookup.query)}**…`;
+    return lookup.result
+      ? getModelDetailsMarkdown(lookup.result, lookup.hasApiKey)
+      : `Resolving **${escapeMarkdown(lookup.query)}**…`;
   }
 
   if (lookup.status === "error") {
     return `## Error\n\n${escapeMarkdown(lookup.message)}`;
   }
 
-  return getThroughputMarkdown(lookup.result, lookup.hasApiKey);
+  return getModelDetailsMarkdown(lookup.result, lookup.hasApiKey);
+}
+
+function getModelDetailsMarkdown(
+  result: LookupResult,
+  hasApiKey: boolean,
+): string {
+  return [
+    getThroughputMarkdown(result, hasApiKey),
+    result.intelligenceIndex
+      ? getIntelligenceIndexMarkdown(result.intelligenceIndex)
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function getIntelligenceIndexMarkdown(result: IntelligenceIndexResult): string {
+  const content = result.entries.length
+    ? result.entries.map(formatIntelligenceIndexRow).join("  \n")
+    : `_${escapeMarkdown(result.note)}_`;
+
+  return ["**Intelligence Index**", "", content].join("\n");
 }
 
 function getThroughputMarkdown(
   result: LookupResult,
   hasApiKey: boolean,
 ): string {
-  const rows = result.endpoints.map(formatThroughputRow);
+  if (result.throughputError) {
+    return [
+      "**Throughput**",
+      "",
+      `_${escapeMarkdown(result.throughputError)}_`,
+    ].join("\n");
+  }
+
+  if (!result.endpoints) {
+    return "";
+  }
+
+  const rows = [...result.endpoints]
+    .sort(compareEndpointsByThroughput)
+    .map(formatThroughputRow);
   const note = getThroughputNote(result, hasApiKey);
 
   return (
@@ -409,7 +908,8 @@ function getThroughputMarkdown(
 }
 
 function getThroughputNote(result: LookupResult, hasApiKey: boolean): string {
-  const unavailableCount = result.endpoints.filter(
+  const endpoints = result.endpoints ?? [];
+  const unavailableCount = endpoints.filter(
     (endpoint) => !endpoint.throughput_last_30m,
   ).length;
 
@@ -417,7 +917,7 @@ function getThroughputNote(result: LookupResult, hasApiKey: boolean): string {
     return "OpenRouter only returns throughput stats when an API key is configured in preferences.";
   }
 
-  if (hasApiKey && unavailableCount === result.endpoints.length) {
+  if (hasApiKey && unavailableCount === endpoints.length) {
     return "OpenRouter did not return throughput stats for any provider. Check the Raycast logs for the raw OpenRouter response.";
   }
 
@@ -428,11 +928,34 @@ function formatThroughputRow(endpoint: OpenRouterEndpoint): string {
   return `${escapeMarkdown(endpoint.provider_name)}: ${formatThroughputValue(endpoint)}`;
 }
 
+function compareEndpointsByThroughput(
+  left: OpenRouterEndpoint,
+  right: OpenRouterEndpoint,
+): number {
+  const leftThroughput = left.throughput_last_30m?.p50 ?? -1;
+  const rightThroughput = right.throughput_last_30m?.p50 ?? -1;
+
+  return (
+    rightThroughput - leftThroughput ||
+    left.provider_name.localeCompare(right.provider_name)
+  );
+}
+
 function formatThroughputValue(endpoint: OpenRouterEndpoint): string {
   const throughput = endpoint.throughput_last_30m?.p50;
   return throughput == null
     ? "Unavailable"
     : `${formatTokensPerSecond(throughput)} tok/sec`;
+}
+
+function formatIntelligenceIndexRow(entry: IntelligenceIndexEntry): string {
+  return `${escapeMarkdown(entry.label)} · ${formatIntelligenceIndexScore(entry.score)}`;
+}
+
+function formatIntelligenceIndexScore(value: number): string {
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: 0,
+  }).format(value);
 }
 
 function formatTokensPerSecond(value: number): string {
@@ -442,15 +965,21 @@ function formatTokensPerSecond(value: number): string {
 }
 
 function getListItemTitle(lookup: LookupState, hasSearchText: boolean): string {
-  if (lookup.status === "success") return lookup.result.modelName;
-  if (lookup.status === "loading") return "Looking Up Model…";
+  if (lookup.status === "success")
+    return lookup.result.modelName ?? lookup.result.modelId;
+  if (lookup.status === "loading") {
+    return (
+      lookup.result?.modelName ?? lookup.result?.modelId ?? "Looking Up Model…"
+    );
+  }
   if (lookup.status === "error") return "Lookup Failed";
   return hasSearchText ? "Press Enter to Look Up Model" : "Model Throughput";
 }
 
 function getListItemSubtitle(lookup: LookupState): string | undefined {
   if (lookup.status === "success") return lookup.result.modelId;
-  if (lookup.status === "loading") return lookup.query;
+  if (lookup.status === "loading")
+    return lookup.result ? lookup.query : undefined;
   return undefined;
 }
 

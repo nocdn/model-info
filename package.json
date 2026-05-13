@@ -41,6 +41,14 @@
       "type": "password",
       "title": "OpenRouter API Key",
       "required": true
+    },
+    {
+      "name": "artificialAnalysisApiKey",
+      "label": "Artificial Analysis API Key",
+      "description": "Used to fetch Artificial Analysis Intelligence Index scores.",
+      "type": "password",
+      "title": "Artificial Analysis API Key",
+      "required": false
     }
   ],
   "title": "Model Info",
