@@ -400,26 +400,38 @@ function getThroughputMarkdown(
   hasApiKey: boolean,
 ): string {
   const rows = result.endpoints.map(formatThroughputRow);
+  const note = getThroughputNote(result, hasApiKey);
+
+  return (
+    [`**Throughput**`, "", ...rows].join("\n") + (note ? `\n\n_${note}_` : "")
+  );
+}
+
+function getThroughputNote(result: LookupResult, hasApiKey: boolean): string {
   const unavailableCount = result.endpoints.filter(
     (endpoint) => !endpoint.throughput_last_30m,
   ).length;
-  const note =
-    !hasApiKey && unavailableCount > 0
-      ? "\n\n_OpenRouter only returns throughput stats when an API key is configured in preferences._"
-      : hasApiKey && unavailableCount === result.endpoints.length
-        ? "\n\n_OpenRouter did not return throughput stats for any provider. Check the Raycast logs for the raw OpenRouter response._"
-        : "";
 
-  return [`## Throughput`, "", ...rows].join("\n") + note;
+  if (!hasApiKey && unavailableCount > 0) {
+    return "OpenRouter only returns throughput stats when an API key is configured in preferences.";
+  }
+
+  if (hasApiKey && unavailableCount === result.endpoints.length) {
+    return "OpenRouter did not return throughput stats for any provider. Check the Raycast logs for the raw OpenRouter response.";
+  }
+
+  return "";
 }
 
 function formatThroughputRow(endpoint: OpenRouterEndpoint): string {
+  return `${escapeMarkdown(endpoint.provider_name)}: ${formatThroughputValue(endpoint)}`;
+}
+
+function formatThroughputValue(endpoint: OpenRouterEndpoint): string {
   const throughput = endpoint.throughput_last_30m?.p50;
-  const value =
-    throughput == null
-      ? "Unavailable"
-      : `${formatTokensPerSecond(throughput)} tok/sec`;
-  return `${escapeMarkdown(endpoint.provider_name)}: ${value}`;
+  return throughput == null
+    ? "Unavailable"
+    : `${formatTokensPerSecond(throughput)} tok/sec`;
 }
 
 function formatTokensPerSecond(value: number): string {
