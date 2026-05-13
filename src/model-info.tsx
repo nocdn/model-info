@@ -403,7 +403,8 @@ function getThroughputMarkdown(
   const note = getThroughputNote(result, hasApiKey);
 
   return (
-    [`**Throughput**`, "", ...rows].join("\n") + (note ? `\n\n_${note}_` : "")
+    [`**Throughput**`, "", rows.join("  \n")].join("\n") +
+    (note ? `\n\n_${note}_` : "")
   );
 }
 
