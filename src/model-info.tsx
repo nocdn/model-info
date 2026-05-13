@@ -2,6 +2,7 @@ import {
   Action,
   ActionPanel,
   List,
+  LocalStorage,
   Toast,
   getPreferenceValues,
   showToast,
@@ -12,6 +13,8 @@ const OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1";
 const ARTIFICIAL_ANALYSIS_API_BASE_URL = "https://artificialanalysis.ai/api/v2";
 const LOG_PREFIX = "[Model Info]";
 const MAX_LOGGED_RESPONSE_BODY_LENGTH = 2_000;
+const LOOKUP_HISTORY_STORAGE_KEY = "model-lookup-history";
+const MAX_LOOKUP_HISTORY_ENTRIES = 25;
 
 type Preferences = {
   openRouterApiKey?: string;
@@ -102,14 +105,39 @@ type LookupState =
   | { status: "success"; result: LookupResult; hasApiKey: boolean }
   | { status: "error"; message: string };
 
+type LookupHistoryEntry = {
+  modelId: string;
+  modelName?: string;
+  lastQuery: string;
+  updatedAt: number;
+};
+
 export default function ModelInfo() {
   const [model, setModel] = React.useState("");
   const [lookup, setLookup] = React.useState<LookupState>({ status: "idle" });
+  const [history, setHistory] = React.useState<LookupHistoryEntry[]>([]);
   const lookupRequestId = React.useRef(0);
 
-  const lookUpModel = async () => {
-    const query = model.trim();
+  React.useEffect(() => {
+    void loadLookupHistory().then(setHistory);
+  }, []);
+
+  const upsertHistory = React.useCallback(
+    (entry: Omit<LookupHistoryEntry, "updatedAt">) => {
+      setHistory((currentHistory) => {
+        const nextHistory = upsertLookupHistoryEntry(currentHistory, entry);
+        void saveLookupHistory(nextHistory);
+        return nextHistory;
+      });
+    },
+    [],
+  );
+
+  const lookUpModel = async (queryOverride?: string) => {
+    const query = (queryOverride ?? model).trim();
     if (!query) return;
+
+    if (queryOverride) setModel(queryOverride);
 
     const preferences = getPreferenceValues<Preferences>();
     const apiKey = preferences.openRouterApiKey?.trim();
@@ -153,6 +181,8 @@ export default function ModelInfo() {
       const modelId = await resolveModelId(query, apiKey);
       if (lookupRequestId.current !== requestId) return;
 
+      upsertHistory({ modelId, lastQuery: query });
+
       setLookup({
         status: "loading",
         query,
@@ -182,6 +212,12 @@ export default function ModelInfo() {
 
       const throughputLookup = fetchModelThroughput(modelId, apiKey)
         .then((throughput) => {
+          upsertHistory({
+            modelId: throughput.modelId,
+            modelName: throughput.modelName,
+            lastQuery: query,
+          });
+
           updateLoadingResult((currentResult) => ({
             ...currentResult,
             modelName: throughput.modelName,
@@ -272,6 +308,16 @@ export default function ModelInfo() {
   };
 
   const hasSearchText = model.trim().length > 0;
+  const activeResult = getActiveLookupResult(lookup);
+  const activeHistoryModelId = activeResult?.modelId;
+  const activeHistoryIds = new Set(history.map((entry) => entry.modelId));
+  const shouldShowTransientLookupItem =
+    lookup.status !== "idle" &&
+    (!activeHistoryModelId || !activeHistoryIds.has(activeHistoryModelId));
+  const shouldShowSearchActionItem =
+    lookup.status === "idle" &&
+    hasSearchText &&
+    !isCurrentSearchTopHistoryEntry(model, history[0]);
 
   return (
     <List
@@ -289,27 +335,163 @@ export default function ModelInfo() {
         </ActionPanel>
       }
     >
-      <List.Item
-        id="model-throughput"
-        title={getListItemTitle(lookup, hasSearchText)}
-        subtitle={getListItemSubtitle(lookup)}
-        detail={<List.Item.Detail markdown={getDetailMarkdown(lookup)} />}
-        actions={
-          <ActionPanel>
-            <Action title="Look up Model" onAction={() => void lookUpModel()} />
-            {lookup.status === "success" ? (
-              <Action.CopyToClipboard
-                title="Copy Model Details"
-                content={getModelDetailsMarkdown(
-                  lookup.result,
-                  lookup.hasApiKey,
-                )}
-              />
-            ) : null}
-          </ActionPanel>
-        }
-      />
+      {shouldShowSearchActionItem ? (
+        <List.Item
+          id="lookup-current-search"
+          title="Press Enter to Look Up Model"
+          subtitle={model.trim()}
+          actions={getLookupActions(lookup, () => void lookUpModel())}
+        />
+      ) : null}
+      {shouldShowTransientLookupItem ? (
+        <List.Item
+          id="model-throughput"
+          title={getListItemTitle(lookup, hasSearchText)}
+          subtitle={getListItemSubtitle(lookup)}
+          detail={<List.Item.Detail markdown={getDetailMarkdown(lookup)} />}
+          actions={getLookupActions(lookup, () => void lookUpModel())}
+        />
+      ) : null}
+      {history.map((entry) => (
+        <List.Item
+          key={entry.modelId}
+          id={entry.modelId}
+          title={entry.modelName ?? entry.modelId}
+          subtitle={entry.modelId}
+          detail={
+            activeHistoryModelId === entry.modelId ? (
+              <List.Item.Detail markdown={getDetailMarkdown(lookup)} />
+            ) : undefined
+          }
+          actions={getHistoryActions(
+            entry,
+            lookup,
+            () => void lookUpModel(entry.modelId),
+          )}
+        />
+      ))}
     </List>
+  );
+}
+
+function getLookupActions(
+  lookup: LookupState,
+  lookUpModel: () => void,
+): React.ReactElement {
+  return (
+    <ActionPanel>
+      <Action title="Look up Model" onAction={lookUpModel} />
+      {lookup.status === "success" ? (
+        <Action.CopyToClipboard
+          title="Copy Model Details"
+          content={getModelDetailsMarkdown(lookup.result, lookup.hasApiKey)}
+        />
+      ) : null}
+    </ActionPanel>
+  );
+}
+
+function getHistoryActions(
+  entry: LookupHistoryEntry,
+  lookup: LookupState,
+  lookUpModel: () => void,
+): React.ReactElement {
+  const activeResult = getActiveLookupResult(lookup);
+  const isActiveEntry = activeResult?.modelId === entry.modelId;
+
+  return (
+    <ActionPanel>
+      <Action title="Look up Model" onAction={lookUpModel} />
+      {isActiveEntry && lookup.status === "success" ? (
+        <Action.CopyToClipboard
+          title="Copy Model Details"
+          content={getModelDetailsMarkdown(lookup.result, lookup.hasApiKey)}
+        />
+      ) : null}
+    </ActionPanel>
+  );
+}
+
+function getActiveLookupResult(lookup: LookupState): LookupResult | undefined {
+  if (lookup.status === "loading" || lookup.status === "success") {
+    return lookup.result;
+  }
+
+  return undefined;
+}
+
+async function loadLookupHistory(): Promise<LookupHistoryEntry[]> {
+  const serializedHistory = await LocalStorage.getItem<string>(
+    LOOKUP_HISTORY_STORAGE_KEY,
+  );
+  if (!serializedHistory) return [];
+
+  try {
+    const history = JSON.parse(serializedHistory) as LookupHistoryEntry[];
+    return history.filter(isLookupHistoryEntry).sort(compareLookupHistoryEntry);
+  } catch (error) {
+    console.error(`${LOG_PREFIX} Failed to parse lookup history`, { error });
+    return [];
+  }
+}
+
+async function saveLookupHistory(history: LookupHistoryEntry[]): Promise<void> {
+  await LocalStorage.setItem(
+    LOOKUP_HISTORY_STORAGE_KEY,
+    JSON.stringify(history),
+  );
+}
+
+function upsertLookupHistoryEntry(
+  history: LookupHistoryEntry[],
+  entry: Omit<LookupHistoryEntry, "updatedAt">,
+): LookupHistoryEntry[] {
+  const existingEntry = history.find(
+    (historyEntry) => historyEntry.modelId === entry.modelId,
+  );
+  const nextEntry = {
+    ...existingEntry,
+    ...entry,
+    modelName: entry.modelName ?? existingEntry?.modelName,
+    updatedAt: Date.now(),
+  };
+
+  return [
+    nextEntry,
+    ...history.filter((historyEntry) => historyEntry.modelId !== entry.modelId),
+  ]
+    .sort(compareLookupHistoryEntry)
+    .slice(0, MAX_LOOKUP_HISTORY_ENTRIES);
+}
+
+function compareLookupHistoryEntry(
+  left: LookupHistoryEntry,
+  right: LookupHistoryEntry,
+): number {
+  return right.updatedAt - left.updatedAt;
+}
+
+function isLookupHistoryEntry(value: unknown): value is LookupHistoryEntry {
+  if (!value || typeof value !== "object") return false;
+
+  const entry = value as Partial<LookupHistoryEntry>;
+  return (
+    typeof entry.modelId === "string" &&
+    typeof entry.lastQuery === "string" &&
+    typeof entry.updatedAt === "number" &&
+    (entry.modelName == null || typeof entry.modelName === "string")
+  );
+}
+
+function isCurrentSearchTopHistoryEntry(
+  searchText: string,
+  entry: LookupHistoryEntry | undefined,
+): boolean {
+  if (!entry) return false;
+
+  const normalizedSearchText = normalizeForSearch(searchText);
+  return [entry.modelId, entry.modelName ?? "", entry.lastQuery].some(
+    (value) => normalizeForSearch(value) === normalizedSearchText,
   );
 }
 
