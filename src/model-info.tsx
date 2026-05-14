@@ -1,9 +1,11 @@
 import {
   Action,
   ActionPanel,
+  Alert,
   List,
   LocalStorage,
   Toast,
+  confirmAlert,
   getPreferenceValues,
   showToast,
 } from "@raycast/api";
@@ -14,6 +16,7 @@ const ARTIFICIAL_ANALYSIS_API_BASE_URL = "https://artificialanalysis.ai/api/v2";
 const LOG_PREFIX = "[Model Info]";
 const MAX_LOGGED_RESPONSE_BODY_LENGTH = 2_000;
 const LOOKUP_HISTORY_STORAGE_KEY = "model-lookup-history";
+const INTELLIGENCE_INDEX_CACHE_STORAGE_KEY = "intelligence-index-cache";
 const MAX_LOOKUP_HISTORY_ENTRIES = 25;
 
 type Preferences = {
@@ -112,14 +115,31 @@ type LookupHistoryEntry = {
   updatedAt: number;
 };
 
+type IntelligenceIndexCacheEntry = {
+  modelId: string;
+  result: IntelligenceIndexResult;
+  updatedAt: number;
+};
+
+type IntelligenceIndexCache = Record<string, IntelligenceIndexCacheEntry>;
+
+type LookUpModelOptions = {
+  fetchThroughput: boolean;
+  fetchIntelligenceIndex: boolean;
+  forceRefreshIntelligenceIndex?: boolean;
+};
+
 export default function ModelInfo() {
   const [model, setModel] = React.useState("");
   const [lookup, setLookup] = React.useState<LookupState>({ status: "idle" });
   const [history, setHistory] = React.useState<LookupHistoryEntry[]>([]);
+  const [intelligenceIndexCache, setIntelligenceIndexCache] =
+    React.useState<IntelligenceIndexCache>({});
   const lookupRequestId = React.useRef(0);
 
   React.useEffect(() => {
     void loadLookupHistory().then(setHistory);
+    void loadIntelligenceIndexCache().then(setIntelligenceIndexCache);
   }, []);
 
   const upsertHistory = React.useCallback(
@@ -133,11 +153,12 @@ export default function ModelInfo() {
     [],
   );
 
-  const lookUpModel = async (queryOverride?: string) => {
+  const fetchModelStats = async (
+    queryOverride: string | undefined,
+    options: LookUpModelOptions,
+  ) => {
     const query = (queryOverride ?? model).trim();
     if (!query) return;
-
-    if (queryOverride) setModel(queryOverride);
 
     const preferences = getPreferenceValues<Preferences>();
     const apiKey = preferences.openRouterApiKey?.trim();
@@ -148,6 +169,11 @@ export default function ModelInfo() {
       query,
       hasOpenRouterApiKey: Boolean(apiKey),
       hasArtificialAnalysisApiKey: Boolean(artificialAnalysisApiKey),
+      fetchThroughput: options.fetchThroughput,
+      fetchIntelligenceIndex: options.fetchIntelligenceIndex,
+      forceRefreshIntelligenceIndex: Boolean(
+        options.forceRefreshIntelligenceIndex,
+      ),
     });
 
     if (!apiKey) {
@@ -181,12 +207,12 @@ export default function ModelInfo() {
       const modelId = await resolveModelId(query, apiKey);
       if (lookupRequestId.current !== requestId) return;
 
-      upsertHistory({ modelId, lastQuery: query });
+      const cachedIntelligenceIndex = intelligenceIndexCache[modelId]?.result;
 
       setLookup({
         status: "loading",
         query,
-        result: { modelId },
+        result: { modelId, intelligenceIndex: cachedIntelligenceIndex },
         hasApiKey: Boolean(apiKey),
         requestId,
       });
@@ -210,31 +236,32 @@ export default function ModelInfo() {
         });
       };
 
-      const throughputLookup = fetchModelThroughput(modelId, apiKey)
-        .then((throughput) => {
-          upsertHistory({
-            modelId: throughput.modelId,
-            modelName: throughput.modelName,
-            lastQuery: query,
-          });
+      let throughputResult:
+        | Awaited<ReturnType<typeof fetchModelThroughput>>
+        | undefined;
+      let intelligenceIndexResult: IntelligenceIndexResult | undefined;
+      let intelligenceIndexError: Error | undefined;
+
+      if (options.fetchThroughput) {
+        try {
+          throughputResult = await fetchModelThroughput(modelId, apiKey);
 
           updateLoadingResult((currentResult) => ({
             ...currentResult,
-            modelName: throughput.modelName,
-            endpoints: throughput.endpoints,
+            modelName: throughputResult?.modelName,
+            endpoints: throughputResult?.endpoints,
           }));
 
           console.info(`${LOG_PREFIX} Model throughput lookup succeeded`, {
             query,
-            modelId: throughput.modelId,
-            modelName: throughput.modelName,
-            endpointCount: throughput.endpoints.length,
-            endpointsWithThroughputCount: throughput.endpoints.filter(
+            modelId: throughputResult.modelId,
+            modelName: throughputResult.modelName,
+            endpointCount: throughputResult.endpoints.length,
+            endpointsWithThroughputCount: throughputResult.endpoints.filter(
               (endpoint) => endpoint.throughput_last_30m,
             ).length,
           });
-        })
-        .catch((error) => {
+        } catch (error) {
           const message =
             error instanceof Error
               ? error.message
@@ -249,28 +276,65 @@ export default function ModelInfo() {
             ...currentResult,
             throughputError: message,
           }));
-        });
+        }
+      }
 
-      const intelligenceIndexLookup = fetchIntelligenceIndex(
-        query,
-        modelId,
-        undefined,
-        artificialAnalysisApiKey,
-      ).then((intelligenceIndex) => {
-        updateLoadingResult((currentResult) => ({
-          ...currentResult,
-          intelligenceIndex,
-        }));
+      if (options.fetchIntelligenceIndex) {
+        try {
+          intelligenceIndexResult = await fetchIntelligenceIndex(
+            query,
+            modelId,
+            throughputResult?.modelName,
+            artificialAnalysisApiKey,
+            { forceRefresh: options.forceRefreshIntelligenceIndex },
+          );
 
-        console.info(`${LOG_PREFIX} Intelligence Index lookup completed`, {
-          query,
-          modelId,
-          intelligenceIndexEntryCount: intelligenceIndex.entries.length,
-        });
-      });
+          updateLoadingResult((currentResult) => ({
+            ...currentResult,
+            intelligenceIndex: intelligenceIndexResult,
+          }));
 
-      await Promise.all([throughputLookup, intelligenceIndexLookup]);
+          if (artificialAnalysisApiKey) {
+            setIntelligenceIndexCache((currentCache) =>
+              upsertIntelligenceIndexCacheEntry(
+                currentCache,
+                modelId,
+                intelligenceIndexResult,
+              ),
+            );
+          }
+
+          console.info(`${LOG_PREFIX} Intelligence Index lookup completed`, {
+            query,
+            modelId,
+            intelligenceIndexEntryCount: intelligenceIndexResult.entries.length,
+          });
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Artificial Analysis Intelligence Index lookup failed.";
+          intelligenceIndexError = new Error(message);
+
+          updateLoadingResult((currentResult) => ({
+            ...currentResult,
+            intelligenceIndex: {
+              entries: [],
+              note: message,
+            },
+          }));
+        }
+      }
+
       if (lookupRequestId.current !== requestId) return;
+
+      if (!isRateLimitError(intelligenceIndexError)) {
+        upsertHistory({
+          modelId: throughputResult?.modelId ?? modelId,
+          modelName: throughputResult?.modelName,
+          lastQuery: query,
+        });
+      }
 
       setLookup((currentLookup) => {
         if (
@@ -290,6 +354,11 @@ export default function ModelInfo() {
 
       toast.style = Toast.Style.Success;
       toast.title = "Data Fetched";
+      if (isRateLimitError(intelligenceIndexError)) {
+        toast.style = Toast.Style.Failure;
+        toast.title = "Intelligence Index Rate Limited";
+        toast.message = intelligenceIndexError.message;
+      }
     } catch (error) {
       const message =
         error instanceof Error
@@ -307,23 +376,85 @@ export default function ModelInfo() {
     }
   };
 
+  const fetchThroughput = (queryOverride?: string) =>
+    fetchModelStats(queryOverride, {
+      fetchThroughput: true,
+      fetchIntelligenceIndex: false,
+    });
+
+  const fetchIntelligenceIndexOnly = (queryOverride?: string) =>
+    fetchModelStats(queryOverride, {
+      fetchThroughput: false,
+      fetchIntelligenceIndex: true,
+      forceRefreshIntelligenceIndex: true,
+    });
+
+  const fetchAllStats = (queryOverride?: string) =>
+    fetchModelStats(queryOverride, {
+      fetchThroughput: true,
+      fetchIntelligenceIndex: true,
+      forceRefreshIntelligenceIndex: true,
+    });
+
+  const removeModelFromHistory = async (entry: LookupHistoryEntry) => {
+    const confirmed = await confirmAlert({
+      title: "Remove model from history?",
+      message: entry.modelName ?? entry.modelId,
+      primaryAction: {
+        title: "Remove model from history",
+        style: Alert.ActionStyle.Destructive,
+      },
+    });
+    if (!confirmed) return;
+
+    setHistory((currentHistory) => {
+      const nextHistory = currentHistory.filter(
+        (historyEntry) => historyEntry.modelId !== entry.modelId,
+      );
+      void saveLookupHistory(nextHistory);
+      return nextHistory;
+    });
+    setIntelligenceIndexCache((currentCache) => {
+      const nextCache = removeIntelligenceIndexCacheEntry(
+        currentCache,
+        entry.modelId,
+      );
+      void saveIntelligenceIndexCache(nextCache);
+      return nextCache;
+    });
+  };
+
+  const clearWholeHistory = async () => {
+    const confirmed = await confirmAlert({
+      title: "Clear whole history?",
+      message:
+        "This will remove every model from history and clear cached Intelligence Index results.",
+      primaryAction: {
+        title: "Clear whole history",
+        style: Alert.ActionStyle.Destructive,
+      },
+    });
+    if (!confirmed) return;
+
+    setHistory([]);
+    setIntelligenceIndexCache({});
+    await LocalStorage.removeItem(LOOKUP_HISTORY_STORAGE_KEY);
+    await LocalStorage.removeItem(INTELLIGENCE_INDEX_CACHE_STORAGE_KEY);
+  };
+
   const hasSearchText = model.trim().length > 0;
   const activeResult = getActiveLookupResult(lookup);
   const activeHistoryModelId = activeResult?.modelId;
-  const activeHistoryIds = new Set(history.map((entry) => entry.modelId));
-  const shouldShowTransientLookupItem =
-    lookup.status !== "idle" &&
-    (!activeHistoryModelId || !activeHistoryIds.has(activeHistoryModelId));
-  const shouldShowSearchActionItem =
-    lookup.status === "idle" &&
-    hasSearchText &&
-    !isCurrentSearchTopHistoryEntry(model, history[0]);
+  const activeLookupMatchesSearch = activeResult
+    ? isLookupResultMatch(activeResult, model)
+    : false;
+  const filteredHistory = getFilteredHistory(history, model);
 
   return (
     <List
       searchText={model}
       isLoading={lookup.status === "loading"}
-      isShowingDetail={lookup.status !== "idle"}
+      isShowingDetail
       filtering={false}
       onSearchTextChange={setModel}
       throttle={false}
@@ -331,28 +462,31 @@ export default function ModelInfo() {
       searchBarPlaceholder="Enter an OpenRouter model, e.g. gpt-5.5"
       actions={
         <ActionPanel>
-          <Action title="Look up Model" onAction={() => void lookUpModel()} />
+          <Action
+            title="Fetch all stats"
+            onAction={() => void fetchAllStats()}
+          />
         </ActionPanel>
       }
     >
-      {shouldShowSearchActionItem ? (
+      {hasSearchText ? (
         <List.Item
           id="lookup-current-search"
-          title="Press Enter to Look Up Model"
+          title="Look Up"
           subtitle={model.trim()}
-          actions={getLookupActions(lookup, () => void lookUpModel())}
+          detail={
+            activeLookupMatchesSearch ? (
+              <List.Item.Detail markdown={getDetailMarkdown(lookup)} />
+            ) : undefined
+          }
+          actions={getLookupActions(
+            () => void fetchThroughput(),
+            () => void fetchIntelligenceIndexOnly(),
+            () => void fetchAllStats(),
+          )}
         />
       ) : null}
-      {shouldShowTransientLookupItem ? (
-        <List.Item
-          id="model-throughput"
-          title={getListItemTitle(lookup, hasSearchText)}
-          subtitle={getListItemSubtitle(lookup)}
-          detail={<List.Item.Detail markdown={getDetailMarkdown(lookup)} />}
-          actions={getLookupActions(lookup, () => void lookUpModel())}
-        />
-      ) : null}
-      {history.map((entry) => (
+      {filteredHistory.map((entry) => (
         <List.Item
           key={entry.modelId}
           id={entry.modelId}
@@ -361,12 +495,20 @@ export default function ModelInfo() {
           detail={
             activeHistoryModelId === entry.modelId ? (
               <List.Item.Detail markdown={getDetailMarkdown(lookup)} />
-            ) : undefined
+            ) : (
+              <List.Item.Detail
+                markdown={getHistoryDetailMarkdown(
+                  intelligenceIndexCache[entry.modelId]?.result,
+                )}
+              />
+            )
           }
           actions={getHistoryActions(
-            entry,
-            lookup,
-            () => void lookUpModel(entry.modelId),
+            () => void fetchThroughput(entry.modelId),
+            () => void fetchIntelligenceIndexOnly(entry.modelId),
+            () => void fetchAllStats(entry.modelId),
+            () => void removeModelFromHistory(entry),
+            () => void clearWholeHistory(),
           )}
         />
       ))}
@@ -375,39 +517,49 @@ export default function ModelInfo() {
 }
 
 function getLookupActions(
-  lookup: LookupState,
-  lookUpModel: () => void,
+  fetchThroughput: () => void,
+  fetchIntelligenceIndex: () => void,
+  fetchAllStats: () => void,
 ): React.ReactElement {
   return (
     <ActionPanel>
-      <Action title="Look up Model" onAction={lookUpModel} />
-      {lookup.status === "success" ? (
-        <Action.CopyToClipboard
-          title="Copy Model Details"
-          content={getModelDetailsMarkdown(lookup.result, lookup.hasApiKey)}
-        />
-      ) : null}
+      <Action title="Fetch throughput" onAction={fetchThroughput} />
+      <Action
+        title="Fetch intelligence index"
+        onAction={fetchIntelligenceIndex}
+      />
+      <Action title="Fetch all stats" onAction={fetchAllStats} />
     </ActionPanel>
   );
 }
 
 function getHistoryActions(
-  entry: LookupHistoryEntry,
-  lookup: LookupState,
-  lookUpModel: () => void,
+  fetchThroughput: () => void,
+  fetchIntelligenceIndex: () => void,
+  fetchAllStats: () => void,
+  removeModelFromHistory: () => void,
+  clearWholeHistory: () => void,
 ): React.ReactElement {
-  const activeResult = getActiveLookupResult(lookup);
-  const isActiveEntry = activeResult?.modelId === entry.modelId;
-
   return (
     <ActionPanel>
-      <Action title="Look up Model" onAction={lookUpModel} />
-      {isActiveEntry && lookup.status === "success" ? (
-        <Action.CopyToClipboard
-          title="Copy Model Details"
-          content={getModelDetailsMarkdown(lookup.result, lookup.hasApiKey)}
+      <Action title="Fetch throughput" onAction={fetchThroughput} />
+      <Action
+        title="Fetch intelligence index"
+        onAction={fetchIntelligenceIndex}
+      />
+      <Action title="Fetch all stats" onAction={fetchAllStats} />
+      <ActionPanel.Section title="Remove">
+        <Action
+          title="Remove model from history"
+          style={Action.Style.Destructive}
+          onAction={removeModelFromHistory}
         />
-      ) : null}
+        <Action
+          title="Clear whole history"
+          style={Action.Style.Destructive}
+          onAction={clearWholeHistory}
+        />
+      </ActionPanel.Section>
     </ActionPanel>
   );
 }
@@ -439,6 +591,79 @@ async function saveLookupHistory(history: LookupHistoryEntry[]): Promise<void> {
   await LocalStorage.setItem(
     LOOKUP_HISTORY_STORAGE_KEY,
     JSON.stringify(history),
+  );
+}
+
+async function loadIntelligenceIndexCache(): Promise<IntelligenceIndexCache> {
+  const serializedCache = await LocalStorage.getItem<string>(
+    INTELLIGENCE_INDEX_CACHE_STORAGE_KEY,
+  );
+  if (!serializedCache) return {};
+
+  try {
+    const cache = JSON.parse(serializedCache) as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(cache).filter(
+        (entry): entry is [string, IntelligenceIndexCacheEntry] =>
+          isIntelligenceIndexCacheEntry(entry[1]),
+      ),
+    );
+  } catch (error) {
+    console.error(`${LOG_PREFIX} Failed to parse Intelligence Index cache`, {
+      error,
+    });
+    return {};
+  }
+}
+
+async function loadCachedIntelligenceIndex(
+  modelId: string,
+): Promise<IntelligenceIndexResult | undefined> {
+  const cache = await loadIntelligenceIndexCache();
+  return cache[modelId]?.result;
+}
+
+async function saveCachedIntelligenceIndex(
+  modelId: string,
+  result: IntelligenceIndexResult,
+): Promise<void> {
+  const cache = await loadIntelligenceIndexCache();
+  const nextCache = upsertIntelligenceIndexCacheEntry(cache, modelId, result);
+  await saveIntelligenceIndexCache(nextCache);
+}
+
+async function saveIntelligenceIndexCache(
+  cache: IntelligenceIndexCache,
+): Promise<void> {
+  await LocalStorage.setItem(
+    INTELLIGENCE_INDEX_CACHE_STORAGE_KEY,
+    JSON.stringify(cache),
+  );
+}
+
+function upsertIntelligenceIndexCacheEntry(
+  cache: IntelligenceIndexCache,
+  modelId: string,
+  result: IntelligenceIndexResult,
+): IntelligenceIndexCache {
+  return {
+    ...cache,
+    [modelId]: {
+      modelId,
+      result,
+      updatedAt: Date.now(),
+    },
+  };
+}
+
+function removeIntelligenceIndexCacheEntry(
+  cache: IntelligenceIndexCache,
+  modelId: string,
+): IntelligenceIndexCache {
+  return Object.fromEntries(
+    Object.entries(cache).filter(
+      ([cachedModelId]) => cachedModelId !== modelId,
+    ),
   );
 }
 
@@ -483,15 +708,64 @@ function isLookupHistoryEntry(value: unknown): value is LookupHistoryEntry {
   );
 }
 
-function isCurrentSearchTopHistoryEntry(
-  searchText: string,
-  entry: LookupHistoryEntry | undefined,
-): boolean {
-  if (!entry) return false;
+function isIntelligenceIndexCacheEntry(
+  value: unknown,
+): value is IntelligenceIndexCacheEntry {
+  if (!value || typeof value !== "object") return false;
 
+  const entry = value as Partial<IntelligenceIndexCacheEntry>;
+  return (
+    typeof entry.modelId === "string" &&
+    typeof entry.updatedAt === "number" &&
+    isIntelligenceIndexResult(entry.result)
+  );
+}
+
+function isIntelligenceIndexResult(
+  value: unknown,
+): value is IntelligenceIndexResult {
+  if (!value || typeof value !== "object") return false;
+
+  const result = value as Partial<IntelligenceIndexResult>;
+  return (
+    typeof result.note === "string" &&
+    Array.isArray(result.entries) &&
+    result.entries.every(isIntelligenceIndexEntry)
+  );
+}
+
+function isIntelligenceIndexEntry(
+  value: unknown,
+): value is IntelligenceIndexEntry {
+  if (!value || typeof value !== "object") return false;
+
+  const entry = value as Partial<IntelligenceIndexEntry>;
+  return typeof entry.label === "string" && typeof entry.score === "number";
+}
+
+function getFilteredHistory(
+  history: LookupHistoryEntry[],
+  searchText: string,
+): LookupHistoryEntry[] {
   const normalizedSearchText = normalizeForSearch(searchText);
-  return [entry.modelId, entry.modelName ?? "", entry.lastQuery].some(
-    (value) => normalizeForSearch(value) === normalizedSearchText,
+  if (!normalizedSearchText) return history;
+
+  return history.filter((entry) =>
+    [entry.modelId, entry.modelName ?? "", entry.lastQuery].some((value) =>
+      normalizeForSearch(value).includes(normalizedSearchText),
+    ),
+  );
+}
+
+function isLookupResultMatch(
+  result: LookupResult,
+  searchText: string,
+): boolean {
+  const normalizedSearchText = normalizeForSearch(searchText);
+  if (!normalizedSearchText) return false;
+
+  return [result.modelId, result.modelName ?? ""].some((value) =>
+    normalizeForSearch(value).includes(normalizedSearchText),
   );
 }
 
@@ -527,6 +801,7 @@ async function fetchIntelligenceIndex(
   modelId: string,
   modelName: string | undefined,
   apiKey: string | undefined,
+  options: { forceRefresh?: boolean } = {},
 ): Promise<IntelligenceIndexResult> {
   if (!apiKey) {
     return {
@@ -535,14 +810,34 @@ async function fetchIntelligenceIndex(
     };
   }
 
+  if (!options.forceRefresh) {
+    const cachedResult = await loadCachedIntelligenceIndex(modelId);
+    if (cachedResult) {
+      console.info(`${LOG_PREFIX} Using cached Intelligence Index`, {
+        query,
+        modelId,
+        intelligenceIndexEntryCount: cachedResult.entries.length,
+      });
+      return cachedResult;
+    }
+  }
+
   try {
     const response =
       await artificialAnalysisFetch<ArtificialAnalysisModelsResponse>(
         "/data/llms/models",
         apiKey,
       );
+    const result = getIntelligenceIndexResult(
+      response.data,
+      query,
+      modelId,
+      modelName,
+    );
 
-    return getIntelligenceIndexResult(response.data, query, modelId, modelName);
+    await saveCachedIntelligenceIndex(modelId, result);
+
+    return result;
   } catch (error) {
     const message =
       error instanceof Error
@@ -556,10 +851,7 @@ async function fetchIntelligenceIndex(
       error,
     });
 
-    return {
-      entries: [],
-      note: message,
-    };
+    throw new Error(message);
   }
 }
 
@@ -776,6 +1068,13 @@ function getArtificialAnalysisErrorMessage(
   } catch {
     return `Artificial Analysis returned ${response.status}.`;
   }
+}
+
+function isRateLimitError(error: Error | undefined): boolean {
+  if (!error) return false;
+
+  const message = normalizeForSearch(error.message);
+  return message.includes("429") || message.includes("rate limit");
 }
 
 function truncateForLog(value: string): string {
@@ -1040,6 +1339,14 @@ function getDetailMarkdown(lookup: LookupState): string {
   return getModelDetailsMarkdown(lookup.result, lookup.hasApiKey);
 }
 
+function getHistoryDetailMarkdown(
+  intelligenceIndex: IntelligenceIndexResult | undefined,
+): string {
+  return intelligenceIndex
+    ? getIntelligenceIndexMarkdown(intelligenceIndex)
+    : "_No cached Intelligence Index for this model yet._";
+}
+
 function getModelDetailsMarkdown(
   result: LookupResult,
   hasApiKey: boolean,
@@ -1144,25 +1451,6 @@ function formatTokensPerSecond(value: number): string {
   return new Intl.NumberFormat("en-US", {
     maximumFractionDigits: value >= 10 ? 0 : 1,
   }).format(value);
-}
-
-function getListItemTitle(lookup: LookupState, hasSearchText: boolean): string {
-  if (lookup.status === "success")
-    return lookup.result.modelName ?? lookup.result.modelId;
-  if (lookup.status === "loading") {
-    return (
-      lookup.result?.modelName ?? lookup.result?.modelId ?? "Looking Up Model…"
-    );
-  }
-  if (lookup.status === "error") return "Lookup Failed";
-  return hasSearchText ? "Press Enter to Look Up Model" : "Model Throughput";
-}
-
-function getListItemSubtitle(lookup: LookupState): string | undefined {
-  if (lookup.status === "success") return lookup.result.modelId;
-  if (lookup.status === "loading")
-    return lookup.result ? lookup.query : undefined;
-  return undefined;
 }
 
 function escapeMarkdown(value: string): string {
