@@ -2,6 +2,7 @@ import {
   Action,
   ActionPanel,
   Alert,
+  Icon,
   List,
   LocalStorage,
   Toast,
@@ -16,7 +17,8 @@ const ARTIFICIAL_ANALYSIS_API_BASE_URL = "https://artificialanalysis.ai/api/v2";
 const LOG_PREFIX = "[Model Info]";
 const MAX_LOGGED_RESPONSE_BODY_LENGTH = 2_000;
 const LOOKUP_HISTORY_STORAGE_KEY = "model-lookup-history";
-const INTELLIGENCE_INDEX_CACHE_STORAGE_KEY = "intelligence-index-cache";
+const ARTIFICIAL_ANALYSIS_MODELS_CACHE_STORAGE_KEY =
+  "artificial-analysis-models-cache";
 const MAX_LOOKUP_HISTORY_ENTRIES = 25;
 
 type Preferences = {
@@ -78,6 +80,11 @@ type ArtificialAnalysisModelsResponse = {
   data: ArtificialAnalysisModel[];
 };
 
+type ArtificialAnalysisModelsCache = {
+  data: ArtificialAnalysisModel[];
+  updatedAt: number;
+};
+
 type IntelligenceIndexEntry = {
   label: string;
   score: number;
@@ -115,14 +122,6 @@ type LookupHistoryEntry = {
   updatedAt: number;
 };
 
-type IntelligenceIndexCacheEntry = {
-  modelId: string;
-  result: IntelligenceIndexResult;
-  updatedAt: number;
-};
-
-type IntelligenceIndexCache = Record<string, IntelligenceIndexCacheEntry>;
-
 type LookUpModelOptions = {
   fetchThroughput: boolean;
   fetchIntelligenceIndex: boolean;
@@ -133,13 +132,15 @@ export default function ModelInfo() {
   const [model, setModel] = React.useState("");
   const [lookup, setLookup] = React.useState<LookupState>({ status: "idle" });
   const [history, setHistory] = React.useState<LookupHistoryEntry[]>([]);
-  const [intelligenceIndexCache, setIntelligenceIndexCache] =
-    React.useState<IntelligenceIndexCache>({});
+  const [artificialAnalysisModelsCache, setArtificialAnalysisModelsCache] =
+    React.useState<ArtificialAnalysisModelsCache | undefined>();
   const lookupRequestId = React.useRef(0);
 
   React.useEffect(() => {
     void loadLookupHistory().then(setHistory);
-    void loadIntelligenceIndexCache().then(setIntelligenceIndexCache);
+    void loadArtificialAnalysisModelsCache().then(
+      setArtificialAnalysisModelsCache,
+    );
   }, []);
 
   const upsertHistory = React.useCallback(
@@ -207,7 +208,14 @@ export default function ModelInfo() {
       const modelId = await resolveModelId(query, apiKey);
       if (lookupRequestId.current !== requestId) return;
 
-      const cachedIntelligenceIndex = intelligenceIndexCache[modelId]?.result;
+      const cachedIntelligenceIndex = artificialAnalysisModelsCache
+        ? getIntelligenceIndexResult(
+            artificialAnalysisModelsCache.data,
+            query,
+            modelId,
+            undefined,
+          )
+        : undefined;
 
       setLookup({
         status: "loading",
@@ -287,22 +295,13 @@ export default function ModelInfo() {
             throughputResult?.modelName,
             artificialAnalysisApiKey,
             { forceRefresh: options.forceRefreshIntelligenceIndex },
+            setArtificialAnalysisModelsCache,
           );
 
           updateLoadingResult((currentResult) => ({
             ...currentResult,
             intelligenceIndex: intelligenceIndexResult,
           }));
-
-          if (artificialAnalysisApiKey) {
-            setIntelligenceIndexCache((currentCache) =>
-              upsertIntelligenceIndexCacheEntry(
-                currentCache,
-                modelId,
-                intelligenceIndexResult,
-              ),
-            );
-          }
 
           console.info(`${LOG_PREFIX} Intelligence Index lookup completed`, {
             query,
@@ -386,7 +385,6 @@ export default function ModelInfo() {
     fetchModelStats(queryOverride, {
       fetchThroughput: false,
       fetchIntelligenceIndex: true,
-      forceRefreshIntelligenceIndex: true,
     });
 
   const fetchAllStats = (queryOverride?: string) =>
@@ -401,7 +399,7 @@ export default function ModelInfo() {
       title: "Remove model from history?",
       message: entry.modelName ?? entry.modelId,
       primaryAction: {
-        title: "Remove model from history",
+        title: "Remove Model from History",
         style: Alert.ActionStyle.Destructive,
       },
     });
@@ -414,32 +412,24 @@ export default function ModelInfo() {
       void saveLookupHistory(nextHistory);
       return nextHistory;
     });
-    setIntelligenceIndexCache((currentCache) => {
-      const nextCache = removeIntelligenceIndexCacheEntry(
-        currentCache,
-        entry.modelId,
-      );
-      void saveIntelligenceIndexCache(nextCache);
-      return nextCache;
-    });
   };
 
   const clearWholeHistory = async () => {
     const confirmed = await confirmAlert({
       title: "Clear whole history?",
       message:
-        "This will remove every model from history and clear cached Intelligence Index results.",
+        "This will remove every model from history and clear cached Artificial Analysis model data.",
       primaryAction: {
-        title: "Clear whole history",
+        title: "Clear Whole History",
         style: Alert.ActionStyle.Destructive,
       },
     });
     if (!confirmed) return;
 
     setHistory([]);
-    setIntelligenceIndexCache({});
+    setArtificialAnalysisModelsCache(undefined);
     await LocalStorage.removeItem(LOOKUP_HISTORY_STORAGE_KEY);
-    await LocalStorage.removeItem(INTELLIGENCE_INDEX_CACHE_STORAGE_KEY);
+    await LocalStorage.removeItem(ARTIFICIAL_ANALYSIS_MODELS_CACHE_STORAGE_KEY);
   };
 
   const hasSearchText = model.trim().length > 0;
@@ -462,10 +452,12 @@ export default function ModelInfo() {
       searchBarPlaceholder="Enter an OpenRouter model, e.g. gpt-5.5"
       actions={
         <ActionPanel>
-          <Action
-            title="Fetch all stats"
-            onAction={() => void fetchAllStats()}
-          />
+          <ActionPanel.Section title="Refresh">
+            <Action
+              title="Fetch All Stats"
+              onAction={() => void fetchAllStats()}
+            />
+          </ActionPanel.Section>
         </ActionPanel>
       }
     >
@@ -483,35 +475,47 @@ export default function ModelInfo() {
             () => void fetchThroughput(),
             () => void fetchIntelligenceIndexOnly(),
             () => void fetchAllStats(),
+            activeLookupMatchesSearch &&
+              hasIntelligenceIndexScores(activeResult?.intelligenceIndex),
           )}
         />
       ) : null}
-      {filteredHistory.map((entry) => (
-        <List.Item
-          key={entry.modelId}
-          id={entry.modelId}
-          title={entry.modelName ?? entry.modelId}
-          subtitle={entry.modelId}
-          detail={
-            activeHistoryModelId === entry.modelId ? (
-              <List.Item.Detail markdown={getDetailMarkdown(lookup)} />
-            ) : (
-              <List.Item.Detail
-                markdown={getHistoryDetailMarkdown(
-                  intelligenceIndexCache[entry.modelId]?.result,
-                )}
-              />
-            )
-          }
-          actions={getHistoryActions(
-            () => void fetchThroughput(entry.modelId),
-            () => void fetchIntelligenceIndexOnly(entry.modelId),
-            () => void fetchAllStats(entry.modelId),
-            () => void removeModelFromHistory(entry),
-            () => void clearWholeHistory(),
-          )}
-        />
-      ))}
+      {filteredHistory.map((entry) => {
+        const historyIntelligenceIndex = getHistoryIntelligenceIndex(
+          entry,
+          artificialAnalysisModelsCache,
+        );
+        const isActiveHistoryEntry = activeHistoryModelId === entry.modelId;
+        const hasVisibleIntelligenceIndexScores = isActiveHistoryEntry
+          ? hasIntelligenceIndexScores(activeResult?.intelligenceIndex)
+          : hasIntelligenceIndexScores(historyIntelligenceIndex);
+
+        return (
+          <List.Item
+            key={entry.modelId}
+            id={entry.modelId}
+            title={getHistoryModelTitle(entry)}
+            subtitle={entry.modelId}
+            detail={
+              isActiveHistoryEntry ? (
+                <List.Item.Detail markdown={getDetailMarkdown(lookup)} />
+              ) : (
+                <List.Item.Detail
+                  markdown={getHistoryDetailMarkdown(historyIntelligenceIndex)}
+                />
+              )
+            }
+            actions={getHistoryActions(
+              () => void fetchThroughput(entry.modelId),
+              () => void fetchIntelligenceIndexOnly(entry.modelId),
+              () => void fetchAllStats(entry.modelId),
+              () => void removeModelFromHistory(entry),
+              () => void clearWholeHistory(),
+              hasVisibleIntelligenceIndexScores,
+            )}
+          />
+        );
+      })}
     </List>
   );
 }
@@ -520,15 +524,16 @@ function getLookupActions(
   fetchThroughput: () => void,
   fetchIntelligenceIndex: () => void,
   fetchAllStats: () => void,
+  hasVisibleIntelligenceIndexScores: boolean,
 ): React.ReactElement {
   return (
     <ActionPanel>
-      <Action title="Fetch throughput" onAction={fetchThroughput} />
-      <Action
-        title="Fetch intelligence index"
-        onAction={fetchIntelligenceIndex}
-      />
-      <Action title="Fetch all stats" onAction={fetchAllStats} />
+      {getRefreshActions(
+        fetchThroughput,
+        fetchIntelligenceIndex,
+        fetchAllStats,
+        hasVisibleIntelligenceIndexScores,
+      )}
     </ActionPanel>
   );
 }
@@ -539,28 +544,70 @@ function getHistoryActions(
   fetchAllStats: () => void,
   removeModelFromHistory: () => void,
   clearWholeHistory: () => void,
+  hasVisibleIntelligenceIndexScores: boolean,
 ): React.ReactElement {
   return (
     <ActionPanel>
-      <Action title="Fetch throughput" onAction={fetchThroughput} />
-      <Action
-        title="Fetch intelligence index"
-        onAction={fetchIntelligenceIndex}
-      />
-      <Action title="Fetch all stats" onAction={fetchAllStats} />
+      {getRefreshActions(
+        fetchThroughput,
+        fetchIntelligenceIndex,
+        fetchAllStats,
+        hasVisibleIntelligenceIndexScores,
+      )}
       <ActionPanel.Section title="Remove">
         <Action
-          title="Remove model from history"
+          title="Remove Model from History"
           style={Action.Style.Destructive}
           onAction={removeModelFromHistory}
         />
         <Action
-          title="Clear whole history"
+          title="Clear Whole History"
           style={Action.Style.Destructive}
           onAction={clearWholeHistory}
         />
       </ActionPanel.Section>
     </ActionPanel>
+  );
+}
+
+function getRefreshActions(
+  fetchThroughput: () => void,
+  fetchIntelligenceIndex: () => void,
+  fetchAllStats: () => void,
+  preferFetchThroughput: boolean,
+): React.ReactElement {
+  const fetchThroughputAction = (
+    <Action
+      title="Fetch Throughput"
+      icon={Icon.Gauge}
+      onAction={fetchThroughput}
+    />
+  );
+  const fetchIntelligenceIndexAction = (
+    <Action
+      title="Fetch Intelligence Index"
+      icon={Icon.Trophy}
+      onAction={fetchIntelligenceIndex}
+    />
+  );
+  const fetchAllStatsAction = (
+    <Action
+      title="Fetch All Stats"
+      icon={Icon.Snippets}
+      onAction={fetchAllStats}
+    />
+  );
+
+  return (
+    <ActionPanel.Section title="Refresh">
+      {preferFetchThroughput ? fetchThroughputAction : fetchAllStatsAction}
+      {preferFetchThroughput
+        ? fetchIntelligenceIndexAction
+        : fetchThroughputAction}
+      {preferFetchThroughput
+        ? fetchAllStatsAction
+        : fetchIntelligenceIndexAction}
+    </ActionPanel.Section>
   );
 }
 
@@ -594,77 +641,42 @@ async function saveLookupHistory(history: LookupHistoryEntry[]): Promise<void> {
   );
 }
 
-async function loadIntelligenceIndexCache(): Promise<IntelligenceIndexCache> {
+async function loadArtificialAnalysisModelsCache(): Promise<
+  ArtificialAnalysisModelsCache | undefined
+> {
   const serializedCache = await LocalStorage.getItem<string>(
-    INTELLIGENCE_INDEX_CACHE_STORAGE_KEY,
+    ARTIFICIAL_ANALYSIS_MODELS_CACHE_STORAGE_KEY,
   );
-  if (!serializedCache) return {};
+  if (!serializedCache) return undefined;
 
   try {
-    const cache = JSON.parse(serializedCache) as Record<string, unknown>;
-    return Object.fromEntries(
-      Object.entries(cache).filter(
-        (entry): entry is [string, IntelligenceIndexCacheEntry] =>
-          isIntelligenceIndexCacheEntry(entry[1]),
-      ),
-    );
+    const cache = JSON.parse(serializedCache) as unknown;
+    return isArtificialAnalysisModelsCache(cache) ? cache : undefined;
   } catch (error) {
-    console.error(`${LOG_PREFIX} Failed to parse Intelligence Index cache`, {
-      error,
-    });
-    return {};
+    console.error(
+      `${LOG_PREFIX} Failed to parse Artificial Analysis model cache`,
+      {
+        error,
+      },
+    );
+    return undefined;
   }
 }
 
-async function loadCachedIntelligenceIndex(
-  modelId: string,
-): Promise<IntelligenceIndexResult | undefined> {
-  const cache = await loadIntelligenceIndexCache();
-  return cache[modelId]?.result;
-}
+async function saveArtificialAnalysisModelsCache(
+  data: ArtificialAnalysisModel[],
+): Promise<ArtificialAnalysisModelsCache> {
+  const cache: ArtificialAnalysisModelsCache = {
+    data,
+    updatedAt: Date.now(),
+  };
 
-async function saveCachedIntelligenceIndex(
-  modelId: string,
-  result: IntelligenceIndexResult,
-): Promise<void> {
-  const cache = await loadIntelligenceIndexCache();
-  const nextCache = upsertIntelligenceIndexCacheEntry(cache, modelId, result);
-  await saveIntelligenceIndexCache(nextCache);
-}
-
-async function saveIntelligenceIndexCache(
-  cache: IntelligenceIndexCache,
-): Promise<void> {
   await LocalStorage.setItem(
-    INTELLIGENCE_INDEX_CACHE_STORAGE_KEY,
+    ARTIFICIAL_ANALYSIS_MODELS_CACHE_STORAGE_KEY,
     JSON.stringify(cache),
   );
-}
 
-function upsertIntelligenceIndexCacheEntry(
-  cache: IntelligenceIndexCache,
-  modelId: string,
-  result: IntelligenceIndexResult,
-): IntelligenceIndexCache {
-  return {
-    ...cache,
-    [modelId]: {
-      modelId,
-      result,
-      updatedAt: Date.now(),
-    },
-  };
-}
-
-function removeIntelligenceIndexCacheEntry(
-  cache: IntelligenceIndexCache,
-  modelId: string,
-): IntelligenceIndexCache {
-  return Object.fromEntries(
-    Object.entries(cache).filter(
-      ([cachedModelId]) => cachedModelId !== modelId,
-    ),
-  );
+  return cache;
 }
 
 function upsertLookupHistoryEntry(
@@ -708,39 +720,63 @@ function isLookupHistoryEntry(value: unknown): value is LookupHistoryEntry {
   );
 }
 
-function isIntelligenceIndexCacheEntry(
+function isArtificialAnalysisModelsCache(
   value: unknown,
-): value is IntelligenceIndexCacheEntry {
+): value is ArtificialAnalysisModelsCache {
   if (!value || typeof value !== "object") return false;
 
-  const entry = value as Partial<IntelligenceIndexCacheEntry>;
+  const cache = value as Partial<ArtificialAnalysisModelsCache>;
   return (
-    typeof entry.modelId === "string" &&
-    typeof entry.updatedAt === "number" &&
-    isIntelligenceIndexResult(entry.result)
+    typeof cache.updatedAt === "number" &&
+    Array.isArray(cache.data) &&
+    cache.data.every(isArtificialAnalysisModel)
   );
 }
 
-function isIntelligenceIndexResult(
+function isArtificialAnalysisModel(
   value: unknown,
-): value is IntelligenceIndexResult {
+): value is ArtificialAnalysisModel {
   if (!value || typeof value !== "object") return false;
 
-  const result = value as Partial<IntelligenceIndexResult>;
+  const model = value as Partial<ArtificialAnalysisModel>;
   return (
-    typeof result.note === "string" &&
-    Array.isArray(result.entries) &&
-    result.entries.every(isIntelligenceIndexEntry)
+    typeof model.id === "string" &&
+    typeof model.name === "string" &&
+    typeof model.slug === "string" &&
+    (model.model_creator == null ||
+      isArtificialAnalysisModelCreator(model.model_creator)) &&
+    (model.evaluations == null ||
+      isArtificialAnalysisModelEvaluations(model.evaluations))
   );
 }
 
-function isIntelligenceIndexEntry(
+function isArtificialAnalysisModelCreator(
   value: unknown,
-): value is IntelligenceIndexEntry {
+): value is ArtificialAnalysisModel["model_creator"] {
   if (!value || typeof value !== "object") return false;
 
-  const entry = value as Partial<IntelligenceIndexEntry>;
-  return typeof entry.label === "string" && typeof entry.score === "number";
+  const creator = value as Partial<
+    NonNullable<ArtificialAnalysisModel["model_creator"]>
+  >;
+  return (
+    typeof creator.id === "string" &&
+    typeof creator.name === "string" &&
+    (creator.slug == null || typeof creator.slug === "string")
+  );
+}
+
+function isArtificialAnalysisModelEvaluations(
+  value: unknown,
+): value is ArtificialAnalysisModel["evaluations"] {
+  if (!value || typeof value !== "object") return false;
+
+  const evaluations = value as Partial<
+    NonNullable<ArtificialAnalysisModel["evaluations"]>
+  >;
+  return (
+    evaluations.artificial_analysis_intelligence_index == null ||
+    typeof evaluations.artificial_analysis_intelligence_index === "number"
+  );
 }
 
 function getFilteredHistory(
@@ -802,6 +838,7 @@ async function fetchIntelligenceIndex(
   modelName: string | undefined,
   apiKey: string | undefined,
   options: { forceRefresh?: boolean } = {},
+  onModelsCacheChange?: (cache: ArtificialAnalysisModelsCache) => void,
 ): Promise<IntelligenceIndexResult> {
   if (!apiKey) {
     return {
@@ -810,34 +847,15 @@ async function fetchIntelligenceIndex(
     };
   }
 
-  if (!options.forceRefresh) {
-    const cachedResult = await loadCachedIntelligenceIndex(modelId);
-    if (cachedResult) {
-      console.info(`${LOG_PREFIX} Using cached Intelligence Index`, {
-        query,
-        modelId,
-        intelligenceIndexEntryCount: cachedResult.entries.length,
-      });
-      return cachedResult;
-    }
-  }
-
   try {
-    const response =
-      await artificialAnalysisFetch<ArtificialAnalysisModelsResponse>(
-        "/data/llms/models",
-        apiKey,
-      );
-    const result = getIntelligenceIndexResult(
-      response.data,
+    const models = await loadArtificialAnalysisModels(apiKey, {
       query,
       modelId,
       modelName,
-    );
-
-    await saveCachedIntelligenceIndex(modelId, result);
-
-    return result;
+      forceRefresh: options.forceRefresh,
+      onCacheUpdate: onModelsCacheChange,
+    });
+    return getIntelligenceIndexResult(models, query, modelId, modelName);
   } catch (error) {
     const message =
       error instanceof Error
@@ -853,6 +871,55 @@ async function fetchIntelligenceIndex(
 
     throw new Error(message);
   }
+}
+
+async function loadArtificialAnalysisModels(
+  apiKey: string,
+  options: {
+    query: string;
+    modelId: string;
+    modelName: string | undefined;
+    forceRefresh?: boolean;
+    onCacheUpdate?: (cache: ArtificialAnalysisModelsCache) => void;
+  },
+): Promise<ArtificialAnalysisModel[]> {
+  const cachedModels = await loadArtificialAnalysisModelsCache();
+  if (
+    cachedModels &&
+    !options.forceRefresh &&
+    hasArtificialAnalysisModelMatch(
+      cachedModels.data,
+      options.query,
+      options.modelId,
+      options.modelName,
+    )
+  ) {
+    console.info(`${LOG_PREFIX} Using cached Artificial Analysis model data`, {
+      modelCount: cachedModels.data.length,
+      updatedAt: cachedModels.updatedAt,
+    });
+    return cachedModels.data;
+  }
+
+  if (cachedModels && !options.forceRefresh) {
+    console.info(`${LOG_PREFIX} Cached Artificial Analysis data missed model`, {
+      query: options.query,
+      modelId: options.modelId,
+      modelName: options.modelName,
+      modelCount: cachedModels.data.length,
+      updatedAt: cachedModels.updatedAt,
+    });
+  }
+
+  const response =
+    await artificialAnalysisFetch<ArtificialAnalysisModelsResponse>(
+      "/data/llms/models",
+      apiKey,
+    );
+  const cache = await saveArtificialAnalysisModelsCache(response.data);
+  options.onCacheUpdate?.(cache);
+
+  return response.data;
 }
 
 async function resolveModelId(
@@ -1183,6 +1250,18 @@ function getIntelligenceIndexResult(
   return { entries, note: "" };
 }
 
+function hasArtificialAnalysisModelMatch(
+  models: ArtificialAnalysisModel[],
+  query: string,
+  modelId: string,
+  modelName: string | undefined,
+): boolean {
+  const candidates = getArtificialAnalysisSearchKeys(query, modelId, modelName);
+  return models.some(
+    (model) => getArtificialAnalysisMatchScore(model, candidates) > 0,
+  );
+}
+
 function getArtificialAnalysisSearchKeys(
   query: string,
   modelId: string,
@@ -1339,12 +1418,40 @@ function getDetailMarkdown(lookup: LookupState): string {
   return getModelDetailsMarkdown(lookup.result, lookup.hasApiKey);
 }
 
+function getHistoryIntelligenceIndex(
+  entry: LookupHistoryEntry,
+  artificialAnalysisModelsCache: ArtificialAnalysisModelsCache | undefined,
+): IntelligenceIndexResult | undefined {
+  if (!artificialAnalysisModelsCache) {
+    return undefined;
+  }
+
+  return getIntelligenceIndexResult(
+    artificialAnalysisModelsCache.data,
+    entry.lastQuery,
+    entry.modelId,
+    entry.modelName,
+  );
+}
+
 function getHistoryDetailMarkdown(
   intelligenceIndex: IntelligenceIndexResult | undefined,
 ): string {
   return intelligenceIndex
     ? getIntelligenceIndexMarkdown(intelligenceIndex)
-    : "_No cached Intelligence Index for this model yet._";
+    : "Press Enter to fetch details";
+}
+
+function hasIntelligenceIndexScores(
+  intelligenceIndex: IntelligenceIndexResult | undefined,
+): boolean {
+  return Boolean(intelligenceIndex?.entries.length);
+}
+
+function getHistoryModelTitle(entry: LookupHistoryEntry): string {
+  return (
+    stripModelProviderPrefix(entry.modelName ?? "").trim() || entry.modelId
+  );
 }
 
 function getModelDetailsMarkdown(
